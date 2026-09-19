@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +13,7 @@ from typing import Annotated, Any
 import typer
 from pydantic import ValidationError
 
-from . import catalog, components, config, skillset
+from . import catalog, components, config, skillset, usage
 from .contract import (
     AskError,
     AskRequest,
@@ -22,8 +24,15 @@ from .contract import (
     ThinkingConfig,
 )
 from .errors import BotApiError
+from .runner import (
+    AUTH_ENV,
+    ask_result,
+    find_claude,
+    stream_ask,
+    supports_safe_mode,
+    validate_component,
+)
 from .runner import ask as run_ask
-from .runner import ask_result, find_claude, stream_ask, validate_component
 
 app = typer.Typer(
     help="Chat with Claude from the terminal via the Claude Code CLI (uses your subscription).",
@@ -68,7 +77,10 @@ def ask(
     prompt: Annotated[str | None, typer.Argument(help="Message. Piped stdin is appended.")] = None,
     model: Annotated[str | None, typer.Option("--model", "-m", help="Alias or full ID.")] = None,
     skill: Annotated[
-        str | None, typer.Option("--skill", "-k", help="Skill name (see `bot skills list`).")
+        str | None,
+        typer.Option(
+            "--skill", "-k", help="Skill name (`bot skills list`); 'none' skips the default."
+        ),
     ] = None,
     component: Annotated[
         bool, typer.Option("--component", "-c", help="Return a typed UI component tree.")
@@ -112,6 +124,10 @@ def ask(
     if not text.strip():
         typer.echo("error: no prompt given (argument or stdin)", err=True)
         raise typer.Exit(code=2)
+    if render != "json" and not component:
+        typer.echo("warning: --render has no effect without --component", err=True)
+    if stream and json_out:
+        typer.echo("warning: --json prints the whole result at the end; --stream ignored", err=True)
 
     thinking_cfg = (
         ThinkingConfig(enabled=thinking, effort=effort)
@@ -161,12 +177,145 @@ def _footer(response: AskResponse, verbose: bool) -> None:
     if verbose:
         u = response.usage
         skill = f" skill={response.skill}" if response.skill else ""
+        session = f" session={response.session_id}" if response.session_id else ""
         typer.echo(
             f"[{response.model}{skill}] in={u.input_tokens} out={u.output_tokens} "
             f"thinking={u.thinking_tokens} cost=${response.cost_usd:.4f} "
-            f"time={response.duration_ms}ms session={response.session_id}",
+            f"time={response.duration_ms}ms{session}",
             err=True,
         )
+
+
+# --- chat -------------------------------------------------------------------------------
+
+
+CHAT_HELP = "/new starts a fresh session, /session prints the id, /exit quits (or Ctrl-D)."
+
+
+@app.command()
+def chat(
+    model: Annotated[str | None, typer.Option("--model", "-m", help="Alias or full ID.")] = None,
+    skill: Annotated[
+        str | None, typer.Option("--skill", "-k", help="Skill name; 'none' skips the default.")
+    ] = None,
+    effort: Annotated[Effort | None, typer.Option(help="Thinking effort level.")] = None,
+    thinking: Annotated[
+        bool | None, typer.Option("--thinking/--no-thinking", help="Toggle extended thinking.")
+    ] = None,
+    system: Annotated[str | None, typer.Option("--system", "-s", help="System prompt.")] = None,
+    session: Annotated[str | None, typer.Option(help="Continue an earlier chat.")] = None,
+    timeout: Annotated[float | None, typer.Option(help="Seconds to wait per turn.")] = None,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Usage/cost to stderr.")] = False,
+) -> None:
+    """Multi-turn chat in the terminal: every turn resumes the same persisted session."""
+    if sys.stdin.isatty():
+        with contextlib.suppress(ImportError):
+            import readline  # noqa: F401 - line editing and history for input()
+    thinking_cfg = (
+        ThinkingConfig(enabled=thinking, effort=effort)
+        if thinking is not None or effort is not None
+        else None
+    )
+    session_id = session
+    typer.echo(f"bot chat — {CHAT_HELP}", err=True)
+    while True:
+        try:
+            line = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            typer.echo("", err=True)
+            break
+        line = line.strip()
+        if not line:
+            continue
+        if line in ("/exit", "/quit", "/q"):
+            break
+        if line == "/new":
+            session_id = None
+            typer.echo("new session", err=True)
+            continue
+        if line == "/session":
+            typer.echo(session_id or "(none yet)", err=True)
+            continue
+        if line == "/help":
+            typer.echo(CHAT_HELP, err=True)
+            continue
+        req = AskRequest(
+            prompt=line,
+            model=model,
+            skill=skill,
+            system_prompt=system,
+            thinking=thinking_cfg,
+            session_id=session_id,
+            persist_session=True,
+            timeout_s=timeout,
+        )
+        try:
+            response = stream_ask(req, lambda chunk: typer.echo(chunk, nl=False))
+        except BotApiError as exc:
+            typer.echo(f"error [{exc.code.value}]: {exc.message}", err=True)
+            continue
+        typer.echo("")
+        session_id = response.session_id or session_id
+        _footer(response, verbose)
+    if session_id:
+        typer.echo(
+            f"session {session_id} — `bot chat --session {session_id}` continues it", err=True
+        )
+
+
+# --- usage ------------------------------------------------------------------------------
+
+
+@app.command("usage")
+def usage_cmd(
+    since: Annotated[
+        str, typer.Option(help="Window: 30m, 5h, 7d or all (5h = a subscription window).")
+    ] = "5h",
+    tail: Annotated[int, typer.Option(help="Also print the last N calls.")] = 0,
+    json_out: Annotated[bool, typer.Option("--json")] = False,
+    path: Annotated[bool, typer.Option(help="Print the ledger path and exit.")] = False,
+) -> None:
+    """Summarize the call ledger (every ask is appended to usage.jsonl)."""
+    if path:
+        typer.echo(str(usage.path()))
+        return
+    try:
+        cutoff = usage.parse_since(since)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    entries = usage.read(cutoff)
+    summary = usage.summarize(entries)
+    if json_out:
+        payload: dict[str, Any] = {"since": since, "summary": summary}
+        if tail:
+            payload["last"] = entries[-tail:]
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    s = summary
+    typer.echo(
+        f"since {since}: {s['calls']} calls ({s['ok']} ok, {s['errors']} errors) · "
+        f"in {s['input_tokens']:,} · out {s['output_tokens']:,} · "
+        f"thinking {s['thinking_tokens']:,} · "
+        f"cache read {s['cache_read_input_tokens']:,} / "
+        f"created {s['cache_creation_input_tokens']:,} · "
+        f"${s['cost_usd']:.2f} · {s['duration_ms'] / 1000:.1f} s"
+    )
+    for model, row in s["by_model"].items():
+        typer.echo(
+            f"  {model:34} {row['calls']:4} calls  out {row['output_tokens']:7,}  "
+            f"${row['cost_usd']:.2f}"
+        )
+    if s["by_skill"]:
+        typer.echo("  skills: " + ", ".join(f"{k} {v}" for k, v in s["by_skill"].items()))
+    for e in entries[-tail:] if tail else []:
+        outcome = f"out {e.get('output_tokens', 0)}" if e.get("ok") else f"error {e.get('error')}"
+        typer.echo(
+            f"  {e.get('ts', '?')}  {e.get('model', '?'):34} {e.get('skill') or '-':6} "
+            f"{e.get('duration_ms', 0):>6} ms  {outcome}"
+        )
+    if not entries:
+        typer.echo(f"  (no calls recorded at {usage.path()})")
 
 
 # --- models -----------------------------------------------------------------------------
@@ -431,13 +580,39 @@ def skills_path() -> None:
 def serve(
     host: Annotated[str, typer.Option(help="Bind address.")] = "127.0.0.1",
     port: Annotated[int, typer.Option(help="TCP port.")] = 7788,
-    cors: Annotated[str, typer.Option(help="Access-Control-Allow-Origin value.")] = "*",
+    allow_origin: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--allow-origin",
+            "--cors",
+            help="Browser origin allowed to call the server (repeatable), e.g. "
+            "chrome-extension://<id>; '*' allows every page. The playground and "
+            "non-browser clients are always allowed.",
+        ),
+    ] = None,
+    max_concurrent: Annotated[
+        int, typer.Option(help="Simultaneous claude processes; 0 = unlimited.")
+    ] = 2,
+    queue_timeout: Annotated[
+        float, typer.Option(help="Seconds a request waits for a slot before 503 busy.")
+    ] = 15.0,
 ) -> None:
     """Run a local HTTP endpoint (POST /ask, same contract) plus a playground at /."""
     from .server import run
 
-    typer.echo(f"bot-api listening on http://{host}:{port}/  (Ctrl+C to stop)", err=True)
-    run(host=host, port=port, cors=cors)
+    origins = allow_origin or []
+    scope = "any origin" if "*" in origins else ", ".join(origins) or "same-origin only"
+    typer.echo(
+        f"bot-api listening on http://{host}:{port}/  (browser origins: {scope}; Ctrl+C to stop)",
+        err=True,
+    )
+    run(
+        host=host,
+        port=port,
+        allow_origins=origins,
+        max_concurrent=max_concurrent,
+        queue_timeout_s=queue_timeout,
+    )
 
 
 # --- doctor -----------------------------------------------------------------------------
@@ -474,5 +649,24 @@ def doctor() -> None:
     typer.echo(
         f"thinking: {'on' if settings.thinking_enabled else 'off'}, "
         f"effort: {settings.effort.value if settings.effort else 'default'}"
+    )
+    if settings.safe_mode:
+        supported = supports_safe_mode(claude)
+        typer.echo(
+            "safe-mode: on" if supported else "safe-mode: unsupported by this claude (skipped)"
+        )
+    else:
+        typer.echo("safe-mode: off (settings)")
+    present = [var for var in AUTH_ENV if os.environ.get(var)]
+    if present:
+        action = "passed through" if settings.keep_auth_env else "stripped from claude's env"
+        typer.echo(f"env: {', '.join(present)} set — {action}")
+    if os.environ.get("ANTHROPIC_BASE_URL"):
+        typer.echo(f"env: ANTHROPIC_BASE_URL={os.environ['ANTHROPIC_BASE_URL']} (passed through)")
+    ledger = usage.path()
+    typer.echo(
+        f"usage log: {ledger}"
+        + ("" if settings.usage_log else " (disabled)")
+        + (f" ({len(usage.read())} calls)" if ledger.exists() else " (empty)")
     )
     raise typer.Exit(code=0 if ok else 1)

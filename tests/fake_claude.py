@@ -22,7 +22,13 @@ if log := os.environ.get("FAKE_CLAUDE_LOG"):
                 "cwd": os.getcwd(),
                 "env": {
                     k: os.environ.get(k)
-                    for k in ("MAX_THINKING_TOKENS", "CLAUDE_CODE_EFFORT_LEVEL", "ANTHROPIC_MODEL")
+                    for k in (
+                        "MAX_THINKING_TOKENS",
+                        "CLAUDE_CODE_EFFORT_LEVEL",
+                        "ANTHROPIC_MODEL",
+                        "ANTHROPIC_API_KEY",
+                        "CLAUDE_CODE_USE_BEDROCK",
+                    )
                 },
             },
             fh,
@@ -30,6 +36,11 @@ if log := os.environ.get("FAKE_CLAUDE_LOG"):
 
 if args[:1] == ["--version"]:
     print("9.9.9 (Claude Code)")
+    sys.exit(0)
+if args[:1] == ["--help"]:
+    print("Usage: claude [options] [command] [prompt]")
+    if not os.environ.get("FAKE_CLAUDE_OLD"):
+        print("  --safe-mode   Start with all customizations disabled")
     sys.exit(0)
 if args[:2] == ["auth", "status"]:
     print(json.dumps({"loggedIn": True, "email": "t@example.com", "subscriptionType": "max"}))

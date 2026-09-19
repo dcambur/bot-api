@@ -34,6 +34,7 @@ class ErrorCode(StrEnum):
     timeout = "timeout"
     claude_error = "claude_error"
     bad_output = "bad_output"
+    busy = "busy"
 
 
 class ThinkingConfig(BaseModel):
@@ -60,7 +61,9 @@ class AskRequest(BaseModel):
         default=None, description="Model alias (sonnet, opus, ...) or full ID. Default: configured."
     )
     skill: str | None = Field(
-        default=None, description="Skill name (bot skills list). Default: configured skill, if any."
+        default=None,
+        description="Skill name (bot skills list); 'none' skips the configured default skill. "
+        "Default: configured skill, if any.",
     )
     component: bool = Field(
         default=False,
@@ -97,7 +100,9 @@ class AskResponse(BaseModel):
     text: str
     structured: dict[str, Any] | list[Any] | None = None
     model: str
-    session_id: str
+    session_id: str | None = Field(
+        default=None, description="Set only when the session was persisted and can be resumed."
+    )
     usage: Usage = Field(default_factory=Usage)
     cost_usd: float = 0.0
     duration_ms: int = 0

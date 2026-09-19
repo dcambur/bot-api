@@ -16,6 +16,10 @@ Two hosts, one renderer.
   ```
 - Content scripts cannot spawn processes, so they call `POST http://127.0.0.1:7788/ask`
   (`bot serve` must be running; add `http://127.0.0.1:7788/*` to `host_permissions`).
+  The server only accepts browser origins it was told about, so start it with the
+  extension's id: `bot serve --allow-origin chrome-extension://<id>` (the id is on
+  `chrome://extensions`; a content script's requests carry the page's origin instead, so
+  route them through the background service worker, whose origin is the extension's).
   The `lookup` event re-enters the existing scan → lookup pipeline with `detail.base`.
 
 ## React app (frontend/)

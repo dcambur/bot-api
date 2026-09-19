@@ -29,8 +29,9 @@ function explain(sentence) {
 }
 ```
 
-Each call costs about 3 s of Claude Code start-up (Python's share is ~0.3 s) plus
-2–6 s of model time on Sonnet with thinking off. `bot serve` is for browser
+Each call costs about 3 s of Claude Code start-up (with `--safe-mode`, which bot-api
+passes when the installed claude has it; Python's share is ~0.3 s) plus 2–6 s of model
+time on Sonnet with thinking off. `bot serve` is for browser
 extensions, which cannot spawn processes. `BOT` is `~/.local/bin/bot`, where
 `uv tool install --editable .` in the bot-api checkout puts it. The full design lives
 in yomi-overlay's `docs/EXPLAIN.md`.

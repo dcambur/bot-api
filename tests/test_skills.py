@@ -6,7 +6,7 @@ import pytest
 
 from bot_api import AskRequest, Effort, ErrorCode, ThinkingConfig, ask, ask_result
 from bot_api.config import Settings
-from bot_api.skillset import SkillError, export, load_all, parse, resolve, user_dir
+from bot_api.skillset import SkillError, export, load_all, parse, resolve, scan, user_dir
 from tests.conftest import FakeClaude
 
 
@@ -37,6 +37,20 @@ def test_user_skill_shadows_bundled(isolated_config: Path) -> None:
     skills = load_all()
     assert skills["ja"].source == "user" and skills["ja"].prompt == "MINE"
     assert skills["kr"].model is None
+
+
+def test_broken_user_skill_is_reported_not_fatal(isolated_config: Path) -> None:
+    folder = user_dir()
+    folder.mkdir(parents=True)
+    (folder / "kr.md").write_text("no front matter", encoding="utf-8")
+    (folder / "ja.md").write_text("+++\nname = 'ja'\nbogus = 1\n+++\nx", encoding="utf-8")
+    skills, errors = scan()
+    assert set(errors) == {"kr", "ja"} and "front matter" in errors["kr"]
+    assert "zh" in skills and skills["ja"].source == "bundled"
+    assert load_all() == skills
+    with pytest.raises(SkillError, match="bogus"):
+        resolve("ja")  # a broken override must not silently fall back to the bundled skill
+    assert resolve("zh").source == "bundled"
 
 
 def test_export_copies_bundled(isolated_config: Path) -> None:

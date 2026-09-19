@@ -42,9 +42,15 @@ def fake_claude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeClaude:
         "FAKE_CLAUDE_RESPONSE",
         "FAKE_CLAUDE_SLEEP",
         "FAKE_CLAUDE_NOISE",
+        "FAKE_CLAUDE_OLD",
         "MAX_THINKING_TOKENS",
         "CLAUDE_CODE_EFFORT_LEVEL",
         "ANTHROPIC_MODEL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
     ):
         monkeypatch.delenv(var, raising=False)
     return FakeClaude(bin=shim, log_path=log_path, monkeypatch=monkeypatch)

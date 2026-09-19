@@ -78,24 +78,35 @@ def _bundled() -> dict[str, Skill]:
     return out
 
 
-def _user() -> dict[str, Skill]:
-    out: dict[str, Skill] = {}
+def scan() -> tuple[dict[str, Skill], dict[str, str]]:
+    """All loadable skills by name, plus parse errors of user files by file stem.
+
+    A user skill shadows a bundled one. A broken user file never takes the others down:
+    it is reported, not raised.
+    """
+    skills = _bundled()
+    errors: dict[str, str] = {}
     folder = user_dir()
     if folder.is_dir():
         for file in sorted(folder.glob("*.md")):
-            skill = parse(file.read_text(encoding="utf-8"), source="user", path=str(file))
-            out[skill.name] = skill
-    return out
+            try:
+                skill = parse(file.read_text(encoding="utf-8"), source="user", path=str(file))
+            except (SkillError, OSError) as exc:
+                errors[file.stem] = str(exc)
+                continue
+            skills[skill.name] = skill
+    return dict(sorted(skills.items())), errors
 
 
 def load_all() -> dict[str, Skill]:
     """All skills by name; a user skill shadows a bundled one."""
-    merged = _bundled() | _user()
-    return dict(sorted(merged.items()))
+    return scan()[0]
 
 
 def resolve(name: str) -> Skill:
-    skills = load_all()
+    skills, errors = scan()
+    if name in errors:  # a broken override must not silently fall back to the bundled one
+        raise SkillError(errors[name])
     if name not in skills:
         raise SkillError(
             f"unknown skill {name!r}; available: {', '.join(sorted(skills)) or 'none'}"

@@ -1,6 +1,6 @@
 [project]
 name = "bot-api"
-version = "0.1.0"
+version = "0.2.0"
 description = "Terminal + programmatic chat interface to Claude via the Claude Code CLI (claude -p)"
 readme = "README.md"
 requires-python = ">=3.13"
