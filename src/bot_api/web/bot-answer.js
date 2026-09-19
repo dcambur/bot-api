@@ -119,6 +119,7 @@
     /* skeleton while the model is thinking; error when it is not */
     .sk { display: grid; gap: .55em; }
     .sk i { display: block; height: .9em; border-radius: 3px; background: var(--_rule); position: relative; overflow: hidden; }
+    .sk .l1 { width: 72%; } .sk .l2 { width: 100%; height: 1.6em; margin-top: .5em; } .sk .l3 { width: 55%; }
     .sk i::after { content: ""; position: absolute; inset: 0; transform: translateX(-100%);
       background: linear-gradient(90deg, transparent, color-mix(in srgb, currentColor 10%, transparent), transparent);
       animation: shimmer 1.3s infinite; }
@@ -249,7 +250,8 @@
     _render() {
       if (!this._root) return;
       if (this.loading) {
-        this._root.innerHTML = '<div class="sk" aria-busy="true" aria-label="Explaining"><i style="width:72%"></i><i style="width:100%;height:1.6em;margin-top:.5em"></i><i style="width:55%"></i></div>';
+        // Classes, not style attributes: a host with a strict CSP blocks inline styles.
+        this._root.innerHTML = '<div class="sk" aria-busy="true" aria-label="Explaining"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div>';
         return;
       }
       if (this._error) { this._root.innerHTML = `<p class="error"><b>Couldn't explain.</b> ${esc(this._error)}</p>`; return; }
