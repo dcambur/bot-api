@@ -16,9 +16,13 @@ Requires Python ≥ 3.13, [uv](https://docs.astral.sh/uv/) and the Claude Code C
 ```bash
 npm install -g @anthropic-ai/claude-code   # once
 claude auth login                          # once, opens your browser
-uv sync
-uv run bot doctor                          # verifies everything is wired up
+uv tool install --editable .               # puts `bot` on PATH at ~/.local/bin/bot
+bot doctor                                 # verifies everything is wired up
 ```
+
+Other programs call `~/.local/bin/bot`, which is where `uv tool install` puts it
+(yomi-overlay looks there by default). To hack on bot-api itself without installing,
+`uv sync` and prefix commands with `uv run`.
 
 `bot` finds `claude` on `PATH`, in `~/.npm-global/bin`, `~/.claude/local`, `~/.local/bin`,
 Homebrew, or wherever `BOT_API_CLAUDE_BIN` / the `claude_bin` setting points.
@@ -42,6 +46,7 @@ bot ask -k ja -c --render html "..."              # same, rendered to HTML by bo
 bot skills list|show|use|export|path              # ja, zh bundled; your own in ~/.config/bot-api/skills/
 bot serve                                          # http://127.0.0.1:7788 — POST /ask + playground
 bot models list            # catalog: aliases, effort levels, thinking toggle
+bot models current         # the configured default
 bot models set opus        # or a full ID; --allow-unknown for IDs not in the catalog
 bot thinking on|off        # extended thinking (cannot be turned off on Fable models)
 bot thinking effort xhigh  # low|medium|high|xhigh|max|default (validated per model)
@@ -67,7 +72,7 @@ typed components instead of prose — it picks the `type`:
 
 | type | when | shape |
 |---|---|---|
-| `explanation` | a sentence or phrase | translation, `segments[]` (surface, reading, gloss, role, base), `grammar[]` (pattern, note), style, nuance |
+| `explanation` | a sentence or phrase | source, translation, `segments[]` (surface, reading, gloss, role, base), `grammar[]` (pattern, note), style, nuance |
 | `word` | a single word | headword, reading, pos, meanings, example, note |
 | `comparison` | X vs Y | title, left, right, rows[] (aspect, left, right), summary |
 | `steps` | a procedure | title, steps[] (label, detail) |
@@ -81,7 +86,7 @@ in the model:
   (classic script or ES module). `el.result = askResult` renders it; `el.loading = true`
   shows a skeleton; clicking a word fires a `lookup` event with `{surface, reading, base}`
   so the host opens its own dictionary. Themed only through CSS variables
-  (`--ba-accent`, `--ba-muted`, `--ba-rule`, `--ba-font`, `--ba-font-cjk`, `--ba-size`),
+  (`--ba-fg`, `--ba-accent`, `--ba-muted`, `--ba-rule`, `--ba-font`, `--ba-font-cjk`, `--ba-size`),
   so it looks native inside yomi-overlay's dark gold popup and nantan's slate/green UI alike.
 - **`bot ask -c --render html`** / `bot_api.components.render_html()` — the same tree as
   escaped HTML with matching class names, for previews and non-JS hosts.
@@ -179,6 +184,9 @@ echo '{"prompt":"..."}' | bot ask --request
   `CLAUDE_CODE_EFFORT_LEVEL` is stripped because it would override `--effort`.
 - The child runs in `~/.config/bot-api/workdir` so Claude Code's per-project state never
   lands in your current directory.
+- Every call pays Claude Code's own start-up before the model is even asked: about 3 s
+  measured on Claude Code 2.1.x (Python's share is ~0.3 s). Budget 3–4 s of fixed cost plus
+  1–6 s of model time.
 - The CLI has no "list models" command, so `bot models list` is a hand-maintained catalog
   (`src/bot_api/catalog.py`); unknown IDs are passed through unvalidated.
 

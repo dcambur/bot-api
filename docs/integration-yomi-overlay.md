@@ -7,16 +7,15 @@ dictionary popup.
 ## Runtime shape
 
 ```
-Electron main                       bot-api (bot serve, 127.0.0.1:7788)
-  globalShortcut ⌘E ─► IPC ─► renderer: sentence around last hovered glyph
-                                  │  POST /ask {prompt, skill:"ja", component:true}
-                                  ▼
-                        <bot-answer loading> → .result = json   (2–6 s on Sonnet, thinking off)
+Electron main                                renderer
+  globalShortcut ⌘E ──► IPC 'explain' ──► sentence around the last hovered glyph
+  execFile(bot, ['ask','--request'])  ◄── IPC {prompt, skill:"ja", component:true}
+  stdin: AskRequest, stdout: AskResult ──► <bot-answer loading> → .result = json
 ```
 
-**Recommended transport for Electron: no server.** The renderer's CSP is
-`default-src 'none'`, so it cannot `fetch()`; main is the trust boundary and can run
-`bot ask --request` as a one-shot child instead (JSON on stdin, JSON on stdout):
+**Transport: a one-shot child, no server.** The renderer's CSP is
+`default-src 'none'`, so it cannot `fetch()`; main is the trust boundary and runs
+`bot ask --request` per request (JSON on stdin, JSON on stdout):
 
 ```js
 const { execFile } = require('node:child_process');
@@ -30,9 +29,11 @@ function explain(sentence) {
 }
 ```
 
-Python start-up (~0.3 s) is noise next to the model (4–8 s). `bot serve` is for
-browser extensions, which cannot spawn processes. The full design lives in
-yomi-overlay's `docs/EXPLAIN.md`.
+Each call costs about 3 s of Claude Code start-up (Python's share is ~0.3 s) plus
+2–6 s of model time on Sonnet with thinking off. `bot serve` is for browser
+extensions, which cannot spawn processes. `BOT` is `~/.local/bin/bot`, where
+`uv tool install --editable .` in the bot-api checkout puts it. The full design lives
+in yomi-overlay's `docs/EXPLAIN.md`.
 
 ## Renderer side
 
@@ -62,15 +63,14 @@ yomi-overlay's `docs/EXPLAIN.md`.
    const view = document.createElement('bot-answer');
    view.loading = true;
    panel.replaceChildren(view);
-   fetch('http://127.0.0.1:7788/ask', {
-     method: 'POST', headers: { 'Content-Type': 'application/json' },
-     body: JSON.stringify({ prompt: sentence, skill: 'ja', component: true }),
-   }).then((r) => r.json()).then((res) => { view.result = res; })
-     .catch((err) => { view.error = String(err); });
+   // preload exposes main's explain(sentence) → Promise<AskResult>; it never rejects
+   overlay.explain(sentence).then((res) => { view.result = res; });
    view.addEventListener('lookup', (e) => lookup(e.detail.base || e.detail.surface));
    ```
-5. Degrade honestly (CONVENTIONS.md): if `/health` fails, ⌘E shows the error line
-   ("Couldn't explain. bot serve is not running") — never a stale or partial answer.
+5. Degrade honestly (CONVENTIONS.md): when `bot` is not installed, times out, or exits
+   without a result, main resolves an `ok: false` AskResult (`claude_not_found`,
+   `timeout`, `claude_error`) and `<bot-answer>` shows the error line — never a stale
+   or partial answer.
 
 ## Main side
 
