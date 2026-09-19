@@ -41,7 +41,7 @@ def test_ask_request_contract_roundtrip(fake_claude: FakeClaude) -> None:
     result = runner.invoke(app, ["ask", "--request"], input=json.dumps(req))
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["ok"] is True and payload["session_id"] == "sess-123"
+    assert payload["ok"] is True and payload["session_id"] is None
 
 
 def test_ask_request_invalid_json_is_contract_error(fake_claude: FakeClaude) -> None:
@@ -112,9 +112,60 @@ def test_config_commands(fake_claude: FakeClaude, tmp_path: Path) -> None:
 
 
 def test_doctor(fake_claude: FakeClaude) -> None:
+    fake_claude.monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-nope")
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0, result.output
     assert "logged in as t@example.com (max)" in result.output
+    assert "safe-mode: on" in result.output
+    assert "ANTHROPIC_API_KEY set — stripped" in result.output
+    assert "usage log:" in result.output
+
+
+def test_ask_skill_none_and_flag_warnings(fake_claude: FakeClaude) -> None:
+    assert runner.invoke(app, ["skills", "use", "ja"]).exit_code == 0
+    result = runner.invoke(app, ["ask", "q", "-k", "none", "-v"])
+    assert result.exit_code == 0 and "skill=" not in result.output
+    argv = fake_claude.argv()
+    assert not argv[argv.index("--system-prompt") + 1].startswith("You explain Japanese")
+    result = runner.invoke(app, ["ask", "q", "--render", "html"])
+    assert result.exit_code == 0 and "--render has no effect" in result.output
+    result = runner.invoke(app, ["ask", "q", "--stream", "--json"])
+    assert result.exit_code == 0 and "--stream ignored" in result.output
+
+
+def test_chat_resumes_one_session(fake_claude: FakeClaude) -> None:
+    result = runner.invoke(app, ["chat", "-m", "haiku"], input="hello\n\n/session\nmore\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert "echo: hello" in result.output and "echo: more" in result.output
+    assert "sess-123" in result.output  # /session and the closing hint
+    argv = fake_claude.argv()  # the last call: `more`
+    assert argv[argv.index("--resume") + 1] == "sess-123"
+    assert "--no-session-persistence" not in argv and argv[argv.index("--model") + 1] == "haiku"
+
+
+def test_chat_new_starts_fresh_and_survives_errors(fake_claude: FakeClaude) -> None:
+    fake_claude.respond(is_error=True, api_error_status=500, result="boom")
+    result = runner.invoke(app, ["chat"], input="first\n/new\nsecond\n")
+    assert result.exit_code == 0, result.output
+    assert result.output.count("error [claude_error]") == 2
+    argv = fake_claude.argv()
+    assert "--resume" not in argv  # /new dropped the session; EOF ends the loop
+
+
+def test_usage_command(fake_claude: FakeClaude) -> None:
+    empty = runner.invoke(app, ["usage"])
+    assert (
+        empty.exit_code == 0 and "0 calls" in empty.output and "no calls recorded" in empty.output
+    )
+    assert runner.invoke(app, ["ask", "q", "-k", "ja"]).exit_code == 0
+    assert runner.invoke(app, ["ask", "q", "-m", "opus", "-k", "none"]).exit_code == 0
+    out = runner.invoke(app, ["usage", "--tail", "1"]).output
+    assert "2 calls (2 ok, 0 errors)" in out and "out 10" in out and "skills: " in out
+    assert "sonnet" in out and "opus" in out
+    payload = json.loads(runner.invoke(app, ["usage", "--json", "--since", "all"]).output)
+    assert payload["summary"]["calls"] == 2 and payload["summary"]["by_skill"]["ja"] == 1
+    assert runner.invoke(app, ["usage", "--since", "soon"]).exit_code == 2
+    assert runner.invoke(app, ["usage", "--path"]).output.strip().endswith("usage.jsonl")
 
 
 def test_skills_commands(fake_claude: FakeClaude) -> None:
@@ -138,6 +189,8 @@ def test_ask_with_skill_and_component(fake_claude: FakeClaude) -> None:
     result = runner.invoke(app, ["ask", "q", "-k", "ja", "-c"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == tree
+    as_json = json.loads(runner.invoke(app, ["ask", "q", "-k", "ja", "-c", "--json"]).output)
+    assert as_json["structured"] == tree and as_json["text"] == ""  # the tree is the answer
     result = runner.invoke(app, ["ask", "q", "-k", "ja", "-c", "--render", "html"])
     assert result.exit_code == 0 and result.output.strip() == (
         '<div class="bot-answer bot-answer-text"><p>hello <b>there</b></p></div>'

@@ -7,6 +7,7 @@ the runner and passed through to ``claude --model`` unvalidated.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .contract import Effort
@@ -46,9 +47,17 @@ for _spec in CATALOG:
         _BY_NAME[_alias] = _spec
 
 
+_DATED = re.compile(r"-\d{8}$")
+
+
 def resolve(name: str) -> ModelSpec | None:
-    """Look up an alias or full ID. ``[1m]`` context suffixes are ignored for lookup."""
-    return _BY_NAME.get(name.strip().removesuffix("[1m]"))
+    """Look up an alias or full ID.
+
+    ``[1m]`` context suffixes and dated snapshots (``claude-haiku-4-5-20251001``, the form
+    claude itself reports) resolve to the undated entry.
+    """
+    key = name.strip().removesuffix("[1m]")
+    return _BY_NAME.get(key) or _BY_NAME.get(_DATED.sub("", key))
 
 
 def aliases() -> dict[str, str]:

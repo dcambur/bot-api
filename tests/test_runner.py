@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import time
+
 import pytest
 
 from bot_api import (
@@ -11,6 +14,7 @@ from bot_api import (
     ask,
     ask_result,
     stream_ask,
+    usage,
 )
 from bot_api.config import Settings
 from bot_api.runner import build_command, find_claude
@@ -24,7 +28,7 @@ def _flag(argv: list[str], flag: str) -> str:
 def test_ask_sends_prompt_on_stdin_with_isolation_flags(fake_claude: FakeClaude) -> None:
     resp = ask(AskRequest(prompt="こんにちは"), Settings())
     assert resp.ok and resp.text == "echo: こんにちは"
-    assert resp.model == "sonnet" and resp.session_id == "sess-123"
+    assert resp.model == "sonnet" and resp.session_id is None  # not persisted: not resumable
     assert resp.usage.thinking_tokens == 3 and resp.cost_usd == 0.001
     log = fake_claude.log()
     argv = log["argv"]
@@ -33,6 +37,7 @@ def test_ask_sends_prompt_on_stdin_with_isolation_flags(fake_claude: FakeClaude)
     assert _flag(argv, "--tools") == "" and _flag(argv, "--max-turns") == "1"
     assert _flag(argv, "--setting-sources") == ""
     assert "--no-session-persistence" in argv and "--bare" not in argv
+    assert "--safe-mode" in argv
     assert _flag(argv, "--model") == "sonnet" and "--effort" not in argv
     assert log["env"]["MAX_THINKING_TOKENS"] is None
     assert log["cwd"].endswith("workdir")
@@ -57,7 +62,7 @@ def test_request_overrides_settings(fake_claude: FakeClaude) -> None:
     assert _flag(argv, "--json-schema") == '{"type": "object"}'
     assert "--no-session-persistence" not in argv
     assert log["env"]["MAX_THINKING_TOKENS"] == "0"
-    assert resp.model == "opus"
+    assert resp.model == "opus" and resp.session_id == "sess-123"  # persisted: resumable
 
 
 def test_resume_session(fake_claude: FakeClaude) -> None:
@@ -72,6 +77,34 @@ def test_env_overrides_are_stripped(fake_claude: FakeClaude) -> None:
     ask(AskRequest(prompt="q"), Settings(effort=Effort.low, thinking_enabled=True))
     env = fake_claude.log()["env"]
     assert env["CLAUDE_CODE_EFFORT_LEVEL"] is None and env["MAX_THINKING_TOKENS"] is None
+
+
+def test_auth_env_is_stripped_unless_kept(fake_claude: FakeClaude) -> None:
+    fake_claude.monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-nope")
+    fake_claude.monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    ask(AskRequest(prompt="q"), Settings())
+    env = fake_claude.log()["env"]
+    assert env["ANTHROPIC_API_KEY"] is None and env["CLAUDE_CODE_USE_BEDROCK"] is None
+    ask(AskRequest(prompt="q"), Settings(keep_auth_env=True))
+    env = fake_claude.log()["env"]
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-nope" and env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+
+
+def test_safe_mode_only_when_supported_and_enabled(fake_claude: FakeClaude) -> None:
+    ask(AskRequest(prompt="q"), Settings(safe_mode=False))
+    assert "--safe-mode" not in fake_claude.argv()
+    fake_claude.monkeypatch.setenv("FAKE_CLAUDE_OLD", "1")  # a claude without the flag
+    ask(AskRequest(prompt="q"), Settings())
+    assert "--safe-mode" not in fake_claude.argv()
+
+
+def test_safe_mode_support_is_cached_per_binary(fake_claude: FakeClaude) -> None:
+    from bot_api.runner import supports_safe_mode
+
+    assert supports_safe_mode(fake_claude.bin) is True
+    fake_claude.log_path.unlink()
+    assert supports_safe_mode(fake_claude.bin) is True
+    assert not fake_claude.log_path.exists()  # answered from cli-cache.json, no --help spawn
 
 
 def test_unsupported_effort_is_rejected_before_spawning(fake_claude: FakeClaude) -> None:
@@ -132,6 +165,38 @@ def test_timeout(fake_claude: FakeClaude) -> None:
     assert exc.value.code == ErrorCode.timeout
 
 
+def test_stream_timeout_is_enforced_while_streaming(fake_claude: FakeClaude) -> None:
+    fake_claude.monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "3")
+    t0 = time.monotonic()
+    with pytest.raises(BotApiError) as exc:
+        stream_ask(AskRequest(prompt="q", timeout_s=0.3), lambda _: None, Settings())
+    assert exc.value.code == ErrorCode.timeout
+    assert time.monotonic() - t0 < 2, "the deadline must cover the read loop, not just wait()"
+
+
+def test_usage_ledger_records_success_and_failure(fake_claude: FakeClaude) -> None:
+    ask(AskRequest(prompt="hello", skill="ja", model="opus"), Settings())
+    fake_claude.respond(is_error=True, api_error_status=500, result="boom")
+    ask_result(AskRequest(prompt="q"), Settings())
+    fake_claude.monkeypatch.delenv("FAKE_CLAUDE_RESPONSE")
+    ask(AskRequest(prompt="quiet"), Settings(usage_log=False))
+    lines = [json.loads(line) for line in usage.path().read_text().splitlines()]
+    assert len(lines) == 2
+    ok, bad = lines
+    assert ok["ok"] is True and ok["skill"] == "ja" and ok["model"] == "opus"
+    assert ok["output_tokens"] == 5 and ok["thinking_tokens"] == 3 and ok["prompt_chars"] == 5
+    assert bad["ok"] is False and bad["error"] == "claude_error"
+    summary = usage.summarize(usage.read())
+    assert summary["calls"] == 2 and summary["errors"] == 1 and summary["output_tokens"] == 5
+    assert summary["by_skill"] == {"ja": 1, "(none)": 1}
+
+
+def test_skill_none_skips_configured_default(fake_claude: FakeClaude) -> None:
+    resp = ask(AskRequest(prompt="q", skill="none"), Settings(skill="ja", system_prompt="BASE"))
+    argv = fake_claude.argv()
+    assert argv[argv.index("--system-prompt") + 1] == "BASE" and resp.skill is None
+
+
 def test_missing_binary(no_claude: None) -> None:
     with pytest.raises(BotApiError) as exc:
         find_claude(None)
@@ -144,7 +209,7 @@ def test_stream_ask_delivers_chunks_and_final_result(fake_claude: FakeClaude) ->
     chunks: list[str] = []
     resp = stream_ask(AskRequest(prompt="hello"), chunks.append, Settings())
     assert "".join(chunks) == "echo: hello" and len(chunks) == 2
-    assert resp.text == "echo: hello" and resp.session_id == "sess-123"
+    assert resp.text == "echo: hello" and resp.session_id is None
     argv = fake_claude.argv()
     assert _flag(argv, "--output-format") == "stream-json"
     assert "--verbose" in argv and "--include-partial-messages" in argv

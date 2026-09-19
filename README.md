@@ -40,11 +40,14 @@ bot ask "..." --persist --json                    # keep the session → session
 bot ask "Continue" --session <id>                 # follow-up in that session
 
 bot ask -k ja "猫が窓の外を見ている"              # skill: Japanese sentence explanation
+bot ask -k none "what is 2+2"                     # skip the configured default skill for one call
+bot chat                                           # multi-turn REPL; /new, /session, /exit
 bot ask -k zh -c "我已经吃过饭了。"                # component mode: typed UI tree as JSON
 bot ask -k ja -c --render html "..."              # same, rendered to HTML by bot-api
 
 bot skills list|show|use|export|path              # ja, zh bundled; your own in ~/.config/bot-api/skills/
-bot serve                                          # http://127.0.0.1:7788 — POST /ask + playground
+bot serve --allow-origin chrome-extension://<id>  # http://127.0.0.1:7788 — POST /ask + playground
+bot usage [--since 5h|24h|7d|all] [--tail 5]       # what the last window cost (usage.jsonl ledger)
 bot models list            # catalog: aliases, effort levels, thinking toggle
 bot models current         # the configured default
 bot models set opus        # or a full ID; --allow-unknown for IDs not in the catalog
@@ -63,7 +66,8 @@ both shaped as *translation → word-by-word breakdown with readings → grammar
 one-line nuance*. `bot skills export ja` copies one into `~/.config/bot-api/skills/`
 where your edits shadow the bundled version; any new `<name>.md` there is a new skill.
 
-Precedence for every setting: request flags > skill > `config.toml`.
+Precedence for every setting: request flags > skill > `config.toml`. `-k none` (or
+`"skill": "none"` in a request) drops the configured default skill for that call.
 
 ## Components (typed UI output)
 
@@ -95,6 +99,22 @@ Integration notes: [docs/integration-yomi-overlay.md](docs/integration-yomi-over
 (⌘E → explain the sentence under the cursor) and
 [docs/integration-nantan.md](docs/integration-nantan.md) (extension + React).
 
+## Chat
+
+`bot chat` is a REPL over the same machinery: every turn is one `bot ask --persist` that
+resumes the previous turn's session, streamed as it arrives. `/new` starts a fresh session,
+`/session` prints the id, `/exit` or Ctrl-D quits and prints a `bot chat --session <id>` hint
+so the conversation can be picked up later. It takes the same `-m`, `-k`, `--effort`,
+`--thinking`, `-s` flags as `ask`.
+
+## Usage ledger
+
+Every call — CLI, HTTP, Python, success or failure — appends one JSON line to
+`~/.config/bot-api/usage.jsonl` (`usage_log = false` turns it off). `bot usage` sums the
+last 5 hours by default (a subscription window); `--since 24h`, `--tail 10`, `--json`.
+The `cost_usd` column is what the API would have charged; on a subscription it is a
+proxy for how much of the window a host like ⌘E is spending.
+
 ## HTTP mode
 
 `bot serve` (default `127.0.0.1:7788`) exposes the contract to anything that can
@@ -109,7 +129,15 @@ GET  /           playground: try skills/models/themes, see the component render 
 GET  /static/bot-answer.js
 ```
 
-CORS is `*` by default (`--cors http://…` to restrict). Each request runs one `claude -p`.
+Browser origins are an allowlist. A request carrying an `Origin` header is accepted only
+from the playground itself, from an origin given with `--allow-origin` (repeatable, e.g.
+`chrome-extension://<id>`), or from anywhere with `--allow-origin '*'`; anything else is
+`403`. Without this any web page you visit could spend your subscription through the
+loopback address. Requests without `Origin` (curl, Electron main) are always accepted.
+
+Each request runs one `claude -p`, so at most `--max-concurrent` (default 2) run at once;
+a request that gets no slot within `--queue-timeout` seconds (default 15) is answered
+`503 busy` instead of piling up processes.
 
 ## Message contract (v1)
 
@@ -145,8 +173,13 @@ Only `prompt` is required; every other field falls back to the configured defaul
 ```
 
 Error codes: `invalid_request`, `claude_not_found`, `not_authenticated`, `invalid_model`,
-`unsupported_effort`, `timeout`, `claude_error`, `bad_output`. Exit status is 0 on success,
-1 on any error, 2 on usage mistakes.
+`unsupported_effort`, `timeout`, `claude_error`, `bad_output`, `busy` (HTTP only). Exit
+status is 0 on success, 1 on any error, 2 on usage mistakes.
+
+`session_id` is set only when the request asked for persistence (`persist_session` or
+`session_id`); a one-shot answer cannot be resumed, so it reports `null`. In component
+mode a valid tree is the answer and `text` is `""`; if the tree fails validation the raw
+text stays and a warning says why.
 
 ### From Python (e.g. an OCR pipeline)
 
@@ -174,19 +207,30 @@ echo '{"prompt":"..."}' | bot ask --request
 ## How it works
 
 `bot` spawns `claude -p` with the prompt on stdin and these flags:
-`--output-format json --tools "" --max-turns 1 --setting-sources "" --system-prompt …
---model … [--effort …] [--json-schema …] [--no-session-persistence | --resume <id>]`.
+`--output-format json --tools "" --max-turns 1 --setting-sources "" [--safe-mode]
+--system-prompt … --model … [--effort …] [--json-schema …]
+[--no-session-persistence | --resume <id>]`.
 
 - No tools, one turn, no project/user settings, no hooks or MCP servers: it behaves like
   a chat model, not a coding agent.
 - `--bare` is deliberately **not** used because it disables subscription login.
+  `--safe-mode` (Claude Code ≥ 2.1) is: it skips plugins, hooks, MCP and CLAUDE.md while
+  auth works normally, and cuts ~1.5 s of start-up per call. `bot` checks once per
+  `claude` binary whether the flag exists (cached in `cli-cache.json`); `safe_mode = false`
+  turns it off.
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the Bedrock / Vertex / Foundry switches
+  are stripped from the child's environment so a stray key cannot silently move you off
+  the subscription; `keep_auth_env = true` passes them through. `bot doctor` lists any
+  that are set.
 - Thinking off ⇒ `MAX_THINKING_TOKENS=0` in the child environment (no effect on Fable).
   `CLAUDE_CODE_EFFORT_LEVEL` is stripped because it would override `--effort`.
 - The child runs in `~/.config/bot-api/workdir` so Claude Code's per-project state never
   lands in your current directory.
 - Every call pays Claude Code's own start-up before the model is even asked: about 3 s
-  measured on Claude Code 2.1.x (Python's share is ~0.3 s). Budget 3–4 s of fixed cost plus
-  1–6 s of model time.
+  measured on Claude Code 2.1.x with `--safe-mode`, 4.5 s without (Python's share is
+  ~0.3 s). Budget 3 s of fixed cost plus 1–6 s of model time.
+- Streaming has the same deadline as a plain ask: a watchdog kills a child that stalls
+  mid-answer, so `timeout_s` is honoured whether or not tokens were already flowing.
 - The CLI has no "list models" command, so `bot models list` is a hand-maintained catalog
   (`src/bot_api/catalog.py`); unknown IDs are passed through unvalidated.
 

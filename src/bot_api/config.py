@@ -29,6 +29,15 @@ class Settings(BaseModel):
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     claude_bin: str | None = Field(default=None, description="Path to the claude executable.")
     timeout_s: float = Field(default=300.0, gt=0)
+    safe_mode: bool = Field(
+        default=True,
+        description="Pass --safe-mode to claude when supported (~1.5 s faster start-up).",
+    )
+    keep_auth_env: bool = Field(
+        default=False,
+        description="Pass ANTHROPIC_API_KEY & co. to claude instead of stripping them.",
+    )
+    usage_log: bool = Field(default=True, description="Append every call to usage.jsonl.")
 
 
 def config_path() -> Path:

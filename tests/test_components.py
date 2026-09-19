@@ -82,12 +82,14 @@ def test_component_mode_sets_schema_and_rules(fake_claude: FakeClaude) -> None:
     assert sent == schema()
     assert argv[argv.index("--system-prompt") + 1].endswith(COMPONENT_RULES)
     assert resp.structured == TREE and resp.warnings == []
+    assert resp.text == ""  # a valid tree is the answer; the JSON string is not repeated
 
 
 def test_component_mode_warns_on_bad_tree(fake_claude: FakeClaude) -> None:
     fake_claude.respond(structured_output={"component": {"type": "nope"}})
     resp = ask(AskRequest(prompt="q", component=True), Settings())
     assert any("failed validation" in w for w in resp.warnings)
+    assert resp.text == "echo: q"  # a bad tree keeps the raw text so a host can show it
     fake_claude.respond(structured_output=None)
     resp = ask(AskRequest(prompt="q", component=True), Settings())
     assert any("no structured output" in w for w in resp.warnings)

@@ -3,10 +3,13 @@
 Design notes
 - We deliberately do NOT use ``--bare``: it disables subscription (claude.ai) login.
   Isolation is achieved instead with ``--tools ""``, ``--max-turns 1``,
-  ``--setting-sources ""`` and a replaced ``--system-prompt``.
+  ``--setting-sources ""``, ``--safe-mode`` (when the installed CLI has it; it cuts
+  ~1.5 s of start-up) and a replaced ``--system-prompt``.
 - The prompt is sent on stdin (no argv length limits, no shell quoting of OCR text).
 - ``CLAUDE_CODE_EFFORT_LEVEL`` is stripped from the environment because it would
-  override ``--effort``; thinking is disabled with ``MAX_THINKING_TOKENS=0``.
+  override ``--effort``; thinking is disabled with ``MAX_THINKING_TOKENS=0``. API-key and
+  third-party-provider variables are stripped as well so the child cannot silently leave
+  the subscription login (``keep_auth_env = true`` passes them through).
 """
 
 from __future__ import annotations
@@ -16,12 +19,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import catalog, components, config, skillset
+from . import catalog, components, config, skillset, usage
 from .contract import AskRequest, AskResponse, AskResult, Effort, ErrorCode, Usage
 from .errors import BotApiError
 
@@ -32,6 +36,19 @@ _BIN_CANDIDATES = (
     "/opt/homebrew/bin/claude",
     "/usr/local/bin/claude",
 )
+
+#: Variables that would move the child off the subscription login. Stripped unless
+#: ``keep_auth_env`` is set.
+AUTH_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+#: Request values for ``skill`` that mean "no skill, even if one is configured".
+NO_SKILL = ("", "none")
 
 
 def find_claude(explicit: str | None = None) -> Path:
@@ -55,6 +72,42 @@ def find_claude(explicit: str | None = None) -> Path:
     )
 
 
+def supports_safe_mode(claude: Path) -> bool:
+    """Whether this ``claude`` accepts ``--safe-mode``.
+
+    ``claude --help`` costs ~0.3 s, so the answer is cached per binary (path, mtime, size)
+    in ``<config dir>/cli-cache.json``.
+    """
+    cache_path = config.config_path().parent / "cli-cache.json"
+    try:
+        st = claude.stat()
+    except OSError:
+        return False
+    key = f"{claude}:{st.st_mtime_ns}:{st.st_size}"
+    cache: dict[str, Any] = {}
+    try:
+        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            cache = loaded
+    except (OSError, ValueError):
+        pass
+    if isinstance(cache.get(key), bool):
+        return bool(cache[key])
+    try:
+        out = subprocess.run(
+            [str(claude), "--help"], capture_output=True, text=True, encoding="utf-8", timeout=30
+        )
+        supported = "--safe-mode" in out.stdout
+    except (OSError, subprocess.SubprocessError):
+        supported = False
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({key: supported}), encoding="utf-8")
+    except OSError:
+        pass
+    return supported
+
+
 @dataclass(slots=True)
 class Effective:
     """Request merged with settings; what actually gets sent."""
@@ -66,6 +119,11 @@ class Effective:
     timeout_s: float
     skill: str | None = None
     output_schema: dict[str, Any] | None = None
+    component: bool = False
+    persisted: bool = False
+    safe_mode: bool = False
+    keep_auth_env: bool = False
+    usage_log: bool = True
     warnings: list[str] = field(default_factory=list)
 
 
@@ -76,7 +134,8 @@ def _first[T](*values: T | None) -> T | None:
 def resolve_effective(request: AskRequest, settings: config.Settings) -> Effective:
     """Merge precedence: request > skill > settings."""
     skill: skillset.Skill | None = None
-    if name := request.skill or settings.skill:
+    name = None if request.skill in NO_SKILL else (request.skill or settings.skill)
+    if name:
         try:
             skill = skillset.resolve(name)
         except skillset.SkillError as exc:
@@ -101,6 +160,11 @@ def resolve_effective(request: AskRequest, settings: config.Settings) -> Effecti
         timeout_s=request.timeout_s or settings.timeout_s,
         skill=skill.name if skill else None,
         output_schema=request.output_schema,
+        component=request.component,
+        persisted=bool(request.session_id or request.persist_session),
+        safe_mode=settings.safe_mode,
+        keep_auth_env=settings.keep_auth_env,
+        usage_log=settings.usage_log,
     )
     if request.component:
         eff.system_prompt = f"{eff.system_prompt}\n\n{components.COMPONENT_RULES}"
@@ -135,11 +199,10 @@ def build_command(claude: Path, request: AskRequest, eff: Effective, *, stream: 
         "1",
         "--setting-sources",
         "",
-        "--system-prompt",
-        eff.system_prompt,
-        "--model",
-        eff.model,
     ]
+    if eff.safe_mode:
+        cmd.append("--safe-mode")
+    cmd += ["--system-prompt", eff.system_prompt, "--model", eff.model]
     if stream:
         cmd += ["--verbose", "--include-partial-messages"]
     if eff.effort is not None:
@@ -157,6 +220,9 @@ def build_env(eff: Effective) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)  # would silently override --effort
     env.pop("ANTHROPIC_MODEL", None)
+    if not eff.keep_auth_env:
+        for var in AUTH_ENV:
+            env.pop(var, None)
     if eff.thinking_enabled:
         env.pop("MAX_THINKING_TOKENS", None)
     else:
@@ -188,19 +254,21 @@ def parse_result(payload: dict[str, Any], eff: Effective) -> AskResponse:
         raise BotApiError(ErrorCode.bad_output, "claude did not return a result message")
     if payload.get("is_error"):
         raise _map_error(payload)
-    usage = payload.get("usage") or {}
+    usage_ = payload.get("usage") or {}
     model_usage: dict[str, Any] = payload.get("modelUsage") or {}
+    session_id = payload.get("session_id")
     return AskResponse(
         text=str(payload.get("result") or ""),
         structured=payload.get("structured_output"),
         model=next(iter(model_usage), eff.model),
-        session_id=str(payload.get("session_id", "")),
+        # Only a persisted session can be resumed; anything else would be a dangling ID.
+        session_id=str(session_id) if eff.persisted and session_id else None,
         usage=Usage(
-            input_tokens=usage.get("input_tokens", 0),
-            output_tokens=usage.get("output_tokens", 0),
-            cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
-            cache_creation_input_tokens=usage.get("cache_creation_input_tokens", 0),
-            thinking_tokens=(usage.get("output_tokens_details") or {}).get("thinking_tokens", 0),
+            input_tokens=usage_.get("input_tokens", 0),
+            output_tokens=usage_.get("output_tokens", 0),
+            cache_read_input_tokens=usage_.get("cache_read_input_tokens", 0),
+            cache_creation_input_tokens=usage_.get("cache_creation_input_tokens", 0),
+            thinking_tokens=(usage_.get("output_tokens_details") or {}).get("thinking_tokens", 0),
         ),
         cost_usd=float(payload.get("total_cost_usd") or 0.0),
         duration_ms=int(payload.get("duration_ms") or 0),
@@ -211,15 +279,21 @@ def parse_result(payload: dict[str, Any], eff: Effective) -> AskResponse:
 
 
 def validate_component(response: AskResponse) -> components.Answer | None:
-    """Check a component-mode answer; a bad tree becomes a warning, not a failure."""
+    """Check a component-mode answer; a bad tree becomes a warning, not a failure.
+
+    When the tree is good, ``text`` (the same JSON as a string) is cleared: the tree is the
+    answer. When it is bad, the raw text stays so a host has something to show.
+    """
     if not isinstance(response.structured, dict):
         response.warnings.append("component mode: no structured output returned")
         return None
     try:
-        return components.Answer.model_validate(response.structured)
+        answer = components.Answer.model_validate(response.structured)
     except ValueError as exc:
         response.warnings.append(f"component tree failed validation: {exc}")
         return None
+    response.text = ""
+    return answer
 
 
 def _extract_json(stdout: str) -> dict[str, Any] | None:
@@ -241,18 +315,62 @@ def _extract_json(stdout: str) -> dict[str, Any] | None:
     return None
 
 
-def ask(request: AskRequest, settings: config.Settings | None = None) -> AskResponse:
-    """Send one prompt; return the answer. Raises :class:`BotApiError`."""
+# --- orchestration --------------------------------------------------------------------
+
+
+def _prepare(
+    request: AskRequest, settings: config.Settings | None, *, stream: bool
+) -> tuple[Effective, list[str]]:
     settings = settings or config.load()
     eff = resolve_effective(request, settings)
     claude = find_claude(settings.claude_bin)
-    cmd = build_command(claude, request, eff, stream=False)
+    if eff.safe_mode and not supports_safe_mode(claude):
+        eff.safe_mode = False
+    return eff, build_command(claude, request, eff, stream=stream)
+
+
+def _ledger_base(request: AskRequest, eff: Effective) -> dict[str, Any]:
+    return {
+        "ts": usage.now_iso(),
+        "model": eff.model,
+        "skill": eff.skill,
+        "component": eff.component,
+        "prompt_chars": len(request.prompt),
+    }
+
+
+def _finish(response: AskResponse, request: AskRequest, eff: Effective) -> AskResponse:
+    if request.component:
+        validate_component(response)
+    if eff.usage_log:
+        usage.append(
+            _ledger_base(request, eff)
+            | {
+                "ok": True,
+                "model": response.model,
+                "session_id": response.session_id,
+                "duration_ms": response.duration_ms,
+                "cost_usd": response.cost_usd,
+                "stop_reason": response.stop_reason,
+            }
+            | response.usage.model_dump()
+        )
+    return response
+
+
+def _log_failure(request: AskRequest, eff: Effective, exc: BotApiError) -> None:
+    if eff.usage_log:
+        usage.append(_ledger_base(request, eff) | {"ok": False, "error": exc.code.value})
+
+
+def _run_once(cmd: list[str], request: AskRequest, eff: Effective) -> AskResponse:
     try:
         proc = subprocess.run(
             cmd,
             input=request.prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             env=build_env(eff),
             cwd=_workdir(),
             timeout=eff.timeout_s,
@@ -269,10 +387,18 @@ def ask(request: AskRequest, settings: config.Settings | None = None) -> AskResp
             f"claude exited with {proc.returncode} and no JSON result",
             {"stderr": proc.stderr.strip()[-2000:], "stdout": proc.stdout.strip()[-2000:]},
         )
-    response = parse_result(payload, eff)
-    if request.component:
-        validate_component(response)
-    return response
+    return parse_result(payload, eff)
+
+
+def ask(request: AskRequest, settings: config.Settings | None = None) -> AskResponse:
+    """Send one prompt; return the answer. Raises :class:`BotApiError`."""
+    eff, cmd = _prepare(request, settings, stream=False)
+    try:
+        response = _run_once(cmd, request, eff)
+    except BotApiError as exc:
+        _log_failure(request, eff, exc)
+        raise
+    return _finish(response, request, eff)
 
 
 def ask_result(request: AskRequest, settings: config.Settings | None = None) -> AskResult:
@@ -285,8 +411,11 @@ def ask_result(request: AskRequest, settings: config.Settings | None = None) -> 
 
 def _stream_lines(proc: subprocess.Popen[str], prompt: str) -> Iterator[dict[str, Any]]:
     assert proc.stdin is not None and proc.stdout is not None
-    proc.stdin.write(prompt)
-    proc.stdin.close()
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except BrokenPipeError:  # child died (or was killed) before reading the prompt
+        return
     for line in proc.stdout:
         line = line.strip()
         if not line.startswith("{"):
@@ -299,16 +428,9 @@ def _stream_lines(proc: subprocess.Popen[str], prompt: str) -> Iterator[dict[str
             yield event
 
 
-def stream_ask(
-    request: AskRequest,
-    on_text: Callable[[str], None],
-    settings: config.Settings | None = None,
+def _run_stream(
+    cmd: list[str], request: AskRequest, eff: Effective, on_text: Callable[[str], None]
 ) -> AskResponse:
-    """Like :func:`ask`, but calls ``on_text`` with each text chunk as it arrives."""
-    settings = settings or config.load()
-    eff = resolve_effective(request, settings)
-    claude = find_claude(settings.claude_bin)
-    cmd = build_command(claude, request, eff, stream=True)
     result: dict[str, Any] | None = None
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
         proc = subprocess.Popen(
@@ -321,6 +443,17 @@ def stream_ask(
             env=build_env(eff),
             cwd=_workdir(),
         )
+        # The deadline must cover the whole stream, not just the wait after it: a child
+        # that stalls mid-answer would otherwise block the read loop for ever.
+        timed_out = threading.Event()
+
+        def _expire() -> None:
+            timed_out.set()
+            proc.kill()
+
+        watchdog = threading.Timer(eff.timeout_s, _expire)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             for event in _stream_lines(proc, request.prompt):
                 if event.get("type") == "stream_event":
@@ -329,15 +462,14 @@ def stream_ask(
                         on_text(str(delta.get("text", "")))
                 elif event.get("type") == "result":
                     result = event
-            proc.wait(timeout=eff.timeout_s)
-        except subprocess.TimeoutExpired as exc:
-            proc.kill()
-            raise BotApiError(
-                ErrorCode.timeout, f"claude did not answer within {eff.timeout_s:g}s"
-            ) from exc
+            proc.wait()
         finally:
+            watchdog.cancel()
             if proc.poll() is None:
                 proc.kill()
+                proc.wait()
+        if timed_out.is_set():
+            raise BotApiError(ErrorCode.timeout, f"claude did not answer within {eff.timeout_s:g}s")
         if result is None:
             stderr.seek(0)
             raise BotApiError(
@@ -345,7 +477,19 @@ def stream_ask(
                 f"claude exited with {proc.returncode} without a result message",
                 {"stderr": stderr.read().strip()[-2000:]},
             )
-    response = parse_result(result, eff)
-    if request.component:
-        validate_component(response)
-    return response
+    return parse_result(result, eff)
+
+
+def stream_ask(
+    request: AskRequest,
+    on_text: Callable[[str], None],
+    settings: config.Settings | None = None,
+) -> AskResponse:
+    """Like :func:`ask`, but calls ``on_text`` with each text chunk as it arrives."""
+    eff, cmd = _prepare(request, settings, stream=True)
+    try:
+        response = _run_stream(cmd, request, eff, on_text)
+    except BotApiError as exc:
+        _log_failure(request, eff, exc)
+        raise
+    return _finish(response, request, eff)

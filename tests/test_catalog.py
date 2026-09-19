@@ -15,6 +15,12 @@ def test_context_suffix_and_unknown() -> None:
     assert resolve("claude-nope") is None
 
 
+def test_dated_snapshot_ids_resolve() -> None:
+    assert resolve("claude-haiku-4-5-20251001") is resolve("haiku")  # what claude reports
+    assert resolve("claude-sonnet-5-20260101[1m]") is resolve("sonnet")
+    assert resolve("claude-nope-20251001") is None
+
+
 def test_effort_support_matrix() -> None:
     assert resolve("claude-opus-4-6").supports_effort(Effort.xhigh) is False  # type: ignore[union-attr]
     assert resolve("claude-opus-5").supports_effort(Effort.xhigh) is True  # type: ignore[union-attr]
